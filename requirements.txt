@@ -1,0 +1,13 @@
+fastapi
+uvicorn
+sqlmodel
+jinja2
+python-multipart
+aiofiles
+requests
+python-dotenv
+PySide6
+pywin32
+PyInstaller
+Pillow
+qrcode[pil]

@@ -1,0 +1,1127 @@
+from fastapi import FastAPI, Depends, Request, Form
+from fastapi.responses import HTMLResponse, RedirectResponse, PlainTextResponse
+from fastapi.middleware.cors import CORSMiddleware
+from sqlmodel import SQLModel, Field, Session, create_engine, select, Relationship
+from typing import Optional, List, Dict
+from jinja2 import Template
+from datetime import datetime
+import uuid
+import os
+
+# ----------------- CONFIGURACIÓN BD -----------------
+
+DATABASE_URL = "sqlite:///./sushi_pos.db"  # se crea en la misma carpeta
+
+engine = create_engine(DATABASE_URL, echo=False)
+
+app = FastAPI(title="Sushi POS")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ----------------- MODELOS -----------------
+
+
+class User(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    username: str = Field(index=True, unique=True)
+    full_name: str
+    hashed_password: str  # contraseña tal cual (por ahora)
+    is_admin: bool = Field(default=False)
+
+
+class Category(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    name: str
+    products: List["Product"] = Relationship(back_populates="category")
+
+
+class Product(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    name: str
+    price: float
+    category_id: int = Field(foreign_key="category.id")
+    category: Optional[Category] = Relationship(back_populates="products")
+    recipe_items: List["RecipeItem"] = Relationship(back_populates="product")
+
+
+class Ingredient(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    name: str
+    unit: str = Field(default="pz")  # g, ml, pz, etc.
+    stocks: List["IngredientInventory"] = Relationship(back_populates="ingredient")
+    recipes: List["RecipeItem"] = Relationship(back_populates="ingredient")
+
+
+class IngredientInventory(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    ingredient_id: int = Field(foreign_key="ingredient.id")
+    ingredient: Optional[Ingredient] = Relationship(back_populates="stocks")
+    stock: float = Field(default=0)     # existencias
+    min_stock: float = Field(default=0) # mínimo antes de marcar "bajo"
+
+
+class RecipeItem(SQLModel, table=True):
+    """Relación producto-ingrediente (receta): cuánto ingrediente usa 1 unidad del producto."""
+    id: Optional[int] = Field(default=None, primary_key=True)
+    product_id: int = Field(foreign_key="product.id")
+    ingredient_id: int = Field(foreign_key="ingredient.id")
+    quantity_per_unit: float  # ej: 100 g de arroz por roll
+
+    product: Optional[Product] = Relationship(back_populates="recipe_items")
+    ingredient: Optional[Ingredient] = Relationship(back_populates="recipes")
+
+
+class Order(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    order_type: str  # "COMEDOR", "LLEVAR", "DELIVERY"
+    table_number: Optional[str] = None
+    customer_name: Optional[str] = None
+    delivery_platform: Optional[str] = None  # "RAPPI", "DIDI", "UBER", None
+    items: List["OrderItem"] = Relationship(back_populates="order")
+
+
+class OrderItem(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    order_id: int = Field(foreign_key="order.id")
+    product_id: int = Field(foreign_key="product.id")
+    quantity: int
+    unit_price: float
+    order: Optional[Order] = Relationship(back_populates="items")
+    product: Optional[Product] = Relationship()
+
+
+class CashClose(SQLModel, table=True):
+    """Cierre de caja: quién cerró, cuándo, cuánto había y diferencia."""
+    id: Optional[int] = Field(default=None, primary_key=True)
+    closed_at: datetime = Field(default_factory=datetime.utcnow)
+    user_id: int = Field(foreign_key="user.id")
+    total_sales: float
+    reported_cash: float
+    difference: float  # reported_cash - total_sales
+
+
+# ----------------- SESIONES / LOGIN SIMPLE -----------------
+
+sessions: Dict[str, int] = {}  # token -> user_id
+
+
+def get_session():
+    with Session(engine) as session:
+        yield session
+
+
+def get_current_user(request: Request, db: Session = Depends(get_session)) -> Optional[User]:
+    token = request.cookies.get("session_id")
+    if not token:
+        return None
+    user_id = sessions.get(token)
+    if not user_id:
+        return None
+    user = db.get(User, user_id)
+    return user
+
+
+# ----------------- INICIALIZACIÓN BD + DATOS DEMO -----------------
+
+
+def create_db_and_seed():
+    SQLModel.metadata.create_all(engine)
+    with Session(engine) as session:
+        # usuario admin por defecto
+        admin = session.exec(select(User).where(User.username == "admin")).first()
+        if not admin:
+            admin = User(
+                username="admin",
+                full_name="Administrador",
+                hashed_password="admin",  # contraseña en texto plano
+                is_admin=True,
+            )
+            session.add(admin)
+
+        # categorías básicas
+        if not session.exec(select(Category)).first():
+            categorias = [
+                "Entradas",
+                "Platillos",
+                "Sushis",
+                "Bebidas",
+                "Postres",
+            ]
+            for c in categorias:
+                cat = Category(name=c)
+                session.add(cat)
+            session.commit()
+
+            # productos demo
+            productos_demo = [
+                ("Edamames", 60, "Entradas"),
+                ("Yakimeshi", 90, "Platillos"),
+                ("Sushi California", 110, "Sushis"),
+                ("Refresco Lata", 25, "Bebidas"),
+                ("Helado Frito", 65, "Postres"),
+            ]
+            for nombre, precio, cat_nombre in productos_demo:
+                cat = session.exec(select(Category).where(Category.name == cat_nombre)).first()
+                if cat:
+                    p = Product(name=nombre, price=precio, category_id=cat.id)
+                    session.add(p)
+            session.commit()
+
+        # ingredientes demo
+        if not session.exec(select(Ingredient)).first():
+            ingredientes_demo = [
+                ("Arroz para sushi", "g", 5000, 1000),
+                ("Alga nori", "pz", 100, 20),
+                ("Pepino", "g", 2000, 500),
+                ("Surimi", "g", 2000, 500),
+                ("Aceite para freír", "ml", 5000, 1000),
+                ("Base helado", "g", 1000, 200),
+                ("Refresco lata surtido", "pz", 48, 12),
+                ("Edamame congelado", "g", 3000, 500),
+            ]
+            for nombre, unidad, stock, min_stock in ingredientes_demo:
+                ing = Ingredient(name=nombre, unit=unidad)
+                session.add(ing)
+                session.flush()
+                inv = IngredientInventory(
+                    ingredient_id=ing.id,
+                    stock=stock,
+                    min_stock=min_stock,
+                )
+                session.add(inv)
+            session.commit()
+
+        # recetas demo por producto
+        if not session.exec(select(RecipeItem)).first():
+            recetas = {
+                "Sushi California": [
+                    ("Arroz para sushi", 120.0),
+                    ("Alga nori", 1.0),
+                    ("Pepino", 30.0),
+                    ("Surimi", 40.0),
+                ],
+                "Yakimeshi": [
+                    ("Arroz para sushi", 150.0),
+                    ("Aceite para freír", 10.0),
+                    ("Surimi", 30.0),
+                ],
+                "Edamames": [
+                    ("Edamame congelado", 100.0),
+                ],
+                "Refresco Lata": [
+                    ("Refresco lata surtido", 1.0),
+                ],
+                "Helado Frito": [
+                    ("Base helado", 80.0),
+                    ("Aceite para freír", 10.0),
+                ],
+            }
+
+            for prod_name, lista_ings in recetas.items():
+                producto = session.exec(
+                    select(Product).where(Product.name == prod_name)
+                ).first()
+                if not producto:
+                    continue
+                for ing_name, qty in lista_ings:
+                    ing = session.exec(
+                        select(Ingredient).where(Ingredient.name == ing_name)
+                    ).first()
+                    if not ing:
+                        continue
+                    r = RecipeItem(
+                        product_id=producto.id,
+                        ingredient_id=ing.id,
+                        quantity_per_unit=qty,
+                    )
+                    session.add(r)
+            session.commit()
+
+
+create_db_and_seed()
+
+# ----------------- PLANTILLAS HTML -----------------
+
+LOGIN_HTML = """
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <title>Sushi POS - Login</title>
+    <style>
+        body { font-family: Arial, sans-serif; background:#f5f5f5; display:flex; align-items:center; justify-content:center; height:100vh; margin:0; }
+        .card { background:white; padding:20px; border-radius:10px; box-shadow:0 2px 8px rgba(0,0,0,0.1); width:320px; }
+        input, select { width:100%; padding:8px; margin:6px 0; box-sizing:border-box; }
+        button { width:100%; padding:10px; margin-top:10px; cursor:pointer; }
+        .error { color:red; }
+    </style>
+</head>
+<body>
+<div class="card">
+    <h2>Login Sushi POS</h2>
+    {% if error %}
+    <p class="error">{{ error }}</p>
+    {% endif %}
+    <form method="post" action="/login">
+        <label>Usuario</label>
+        <input type="text" name="username" required>
+        <label>Contraseña</label>
+        <input type="password" name="password" required>
+        <button type="submit">Entrar</button>
+    </form>
+</div>
+</body>
+</html>
+"""
+
+DASHBOARD_HTML = """
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <title>Sushi POS - Menú principal</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin:0; background:#f5f5f5; }
+        header { background:#222; color:white; padding:10px 20px; display:flex; justify-content:space-between; align-items:center; }
+        .user { font-size:0.9rem; }
+        .container { padding:20px; display:flex; flex-wrap:wrap; gap:20px; justify-content:center; }
+        .card { width:220px; height:130px; background:white; border-radius:12px; box-shadow:0 2px 8px rgba(0,0,0,0.15); display:flex; flex-direction:column; justify-content:center; align-items:center; text-align:center; text-decoration:none; color:#222; }
+        .card:hover { box-shadow:0 4px 14px rgba(0,0,0,0.25); transform:translateY(-2px); }
+        .card-title { font-size:1.1rem; font-weight:bold; margin-bottom:6px; }
+        .card-desc { font-size:0.85rem; color:#555; }
+        .tag { font-size:0.7rem; padding:2px 6px; border-radius:8px; background:#eee; margin-top:6px; }
+    </style>
+</head>
+<body>
+<header>
+    <div><strong>Sushi POS</strong> – Menú principal</div>
+    <div class="user">
+        Usuario: {{ user.full_name }} ({{ user.username }}) |
+        <a href="/logout" style="color:#fff;">Salir</a>
+    </div>
+</header>
+
+<div class="container">
+    <a class="card" href="/pos">
+        <div class="card-title">Nuevo pedido</div>
+        <div class="card-desc">Tomar pedido de comedor, para llevar o delivery.</div>
+        <div class="tag">Módulo 2</div>
+    </a>
+    <a class="card" href="/orders/list">
+        <div class="card-title">Pedidos recientes</div>
+        <div class="card-desc">Ver últimos pedidos capturados.</div>
+        <div class="tag">Módulo 2</div>
+    </a>
+    <a class="card" href="/inventario">
+        <div class="card-title">Inventario</div>
+        <div class="card-desc">Ver ingredientes y faltantes.</div>
+        <div class="tag">Módulo 5</div>
+    </a>
+    <a class="card" href="/bot/panel">
+        <div class="card-title">Bot & Automatización</div>
+        <div class="card-desc">Texto para WhatsApp y automatización futura.</div>
+        <div class="tag">Módulo 6</div>
+    </a>
+    <a class="card" href="/caja/cierre">
+        <div class="card-title">Cierre de caja</div>
+        <div class="card-desc">Registrar efectivo y diferencia.</div>
+        <div class="tag">Módulo 7</div>
+    </a>
+    <a class="card" href="/reportes">
+        <div class="card-title">Reportes (demo)</div>
+        <div class="card-desc">Ventas totales simples.</div>
+        <div class="tag">Módulo 7</div>
+    </a>
+</div>
+</body>
+</html>
+"""
+
+POS_HTML = """
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <title>Sushi POS - Nuevo pedido</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin:0; background:#f5f5f5; }
+        header { background:#222; color:white; padding:10px 20px; display:flex; justify-content:space-between; align-items:center; }
+        .user { font-size:0.9rem; }
+        .container { padding:20px; display:flex; gap:20px; }
+        .left, .right { background:white; padding:15px; border-radius:10px; box-shadow:0 2px 8px rgba(0,0,0,0.1); }
+        .left { flex:2; }
+        .right { flex:1; max-width:420px; }
+        h2 { margin-top:0; }
+        table { width:100%; border-collapse:collapse; margin-bottom:10px; }
+        th, td { padding:4px; border-bottom:1px solid #eee; font-size:0.85rem; vertical-align:top; }
+        .category { background:#eee; font-weight:bold; }
+        input[type=number] { width:60px; }
+        select, input[type=text] { width:100%; margin:2px 0; padding:4px; box-sizing:border-box; }
+        button { padding:8px 12px; margin-top:8px; cursor:pointer; }
+        pre { background:#111; color:#0f0; padding:8px; font-size:0.75rem; max-height:220px; overflow:auto; }
+        .inventory-alert { color:red; font-size:0.85rem; }
+        a { color:#fff; }
+        .small-label { font-size:0.75rem; color:#555; }
+        .alert { background:#ffdddd; border:1px solid #ff8888; color:#a00000; padding:8px; margin-bottom:10px; border-radius:6px; }
+    </style>
+</head>
+<body>
+<header>
+    <div><strong>Sushi POS</strong> – Nuevo pedido</div>
+    <div class="user">
+        Usuario: {{ user.full_name }} ({{ user.username }}) |
+        <a href="/menu">Menú principal</a> |
+        <a href="/logout">Salir</a>
+    </div>
+</header>
+
+<div class="container">
+    <div class="left">
+        <h2>Nuevo Pedido</h2>
+
+        {% if alert_message %}
+        <div class="alert">
+            {{ alert_message }}
+        </div>
+        {% endif %}
+
+        <form method="post" action="/orders/create">
+            <label>Tipo de pedido</label>
+            <select name="order_type" required>
+                <option value="COMEDOR">Comedor</option>
+                <option value="LLEVAR">Para llevar</option>
+                <option value="DELIVERY">Delivery</option>
+            </select>
+
+            <label>Mesa (para comedor) o Nombre del cliente</label>
+            <input type="text" name="reference" placeholder="Mesa 5, Kevin, etc.">
+
+            <label>Plataforma delivery (solo si es delivery)</label>
+            <select name="delivery_platform">
+                <option value="">Ninguna / Mostrador</option>
+                <option value="RAPPI">Rappi</option>
+                <option value="DIDI">DiDi</option>
+                <option value="UBER">Uber Eats</option>
+            </select>
+
+            <h3>Productos</h3>
+            <table>
+                <tr>
+                    <th>Cat.</th>
+                    <th>Producto</th>
+                    <th>$</th>
+                    <th>Cant.</th>
+                    <th>Opciones / Notas<br><span class="small-label">(alga, empanizado, sin pepino, etc.)</span></th>
+                </tr>
+                {% for cat in categories %}
+                <tr class="category">
+                    <td colspan="5">{{ cat.name }}</td>
+                </tr>
+                    {% for p in cat.products %}
+                    <tr>
+                        <td></td>
+                        <td>{{ p.name }}</td>
+                        <td>{{ "%.2f"|format(p.price) }}</td>
+                        <td><input type="number" name="qty_{{ p.id }}" value="0" min="0" step="1"></td>
+                        <td>
+                            <select name="alga_{{ p.id }}">
+                                <option value="">Alga (N/A)</option>
+                                <option value="Con alga">Con alga</option>
+                                <option value="Sin alga">Sin alga</option>
+                            </select>
+                            <select name="emp_{{ p.id }}">
+                                <option value="">Empanizado (N/A)</option>
+                                <option value="Empanizado">Empanizado</option>
+                                <option value="Natural">Natural</option>
+                            </select>
+                            <input type="text" name="nota_{{ p.id }}" placeholder="Notas (sin pepino, poco picante, etc.)">
+                        </td>
+                    </tr>
+                    {% endfor %}
+                {% endfor %}
+            </table>
+            <button type="submit">Crear pedido</button>
+        </form>
+
+        {% if last_order %}
+        <p>Último pedido creado: #{{ last_order.id }} - Total: ${{ "%.2f"|format(last_total) }}</p>
+        {% endif %}
+    </div>
+
+    <div class="right">
+        <h2>Tickets</h2>
+        {% if ticket %}
+        <h4>Ticket Cliente</h4>
+        <pre>{{ ticket }}</pre>
+        <h4>Comanda Cocina</h4>
+        <pre>{{ kitchen }}</pre>
+        {% else %}
+        <p>Aquí aparecerá la última venta generada.</p>
+        {% endif %}
+
+        <h3>Ingredientes con inventario bajo</h3>
+        {% if low_inventory %}
+            <ul>
+            {% for item in low_inventory %}
+                <li>{{ item.ingredient.name }} ({{ item.stock }} {{ item.ingredient.unit }})</li>
+            {% endfor %}
+            </ul>
+        {% else %}
+            <p>Todo bien por ahora.</p>
+        {% endif %}
+    </div>
+</div>
+</body>
+</html>
+"""
+
+CIERRE_CAJA_HTML = """
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <title>Sushi POS - Cierre de caja</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin:0; background:#f5f5f5; }
+        header { background:#222; color:white; padding:10px 20px; display:flex; justify-content:space-between; align-items:center; }
+        .user { font-size:0.9rem; }
+        .container { padding:20px; max-width:600px; margin:0 auto; }
+        .box { background:white; padding:15px; border-radius:10px; box-shadow:0 2px 8px rgba(0,0,0,0.1); margin-bottom:15px; }
+        label { display:block; margin:6px 0; }
+        input[type=number] { width:100%; padding:6px; box-sizing:border-box; }
+        button { padding:8px 12px; margin-top:8px; cursor:pointer; }
+        .ok { color:green; }
+        .bad { color:red; }
+        .small { font-size:0.85rem; color:#555; }
+    </style>
+</head>
+<body>
+<header>
+    <div><strong>Sushi POS</strong> – Cierre de caja</div>
+    <div class="user">
+        Usuario: {{ user.full_name }} ({{ user.username }}) |
+        <a href="/menu" style="color:#fff;">Menú principal</a> |
+        <a href="/logout" style="color:#fff;">Salir</a>
+    </div>
+</header>
+
+<div class="container">
+    <div class="box">
+        <h2>Resumen de ventas</h2>
+        <p>Total de ventas acumuladas (todas las órdenes registradas): <strong>${{ "%.2f"|format(total_ventas) }}</strong></p>
+        <p class="small">Más adelante se puede separar por día / turno / desde último cierre.</p>
+    </div>
+
+    <div class="box">
+        <h2>Registrar cierre de caja</h2>
+        {% if closed %}
+            {% if difference|round(2) == 0 %}
+                <p class="ok">✅ Cierre registrado sin diferencia.</p>
+            {% elif difference > 0 %}
+                <p class="bad">⚠ Sobra dinero: ${{ "%.2f"|format(difference) }}</p>
+            {% else %}
+                <p class="bad">⚠ Falta dinero: ${{ "%.2f"|format(difference|abs) }}</p>
+            {% endif %}
+        {% endif %}
+        <form method="post" action="/caja/cierre">
+            <label>Efectivo contado en caja (dinero físico):</label>
+            <input type="number" step="0.01" name="reported_cash" required>
+            <button type="submit">Guardar cierre</button>
+        </form>
+    </div>
+
+    <div class="box">
+        <h3>Último cierre registrado</h3>
+        {% if last_close %}
+            <p>Fecha/hora: {{ last_close.closed_at }}</p>
+            <p>Ventas acumuladas en ese momento: ${{ "%.2f"|format(last_close.total_sales) }}</p>
+            <p>Efectivo contado: ${{ "%.2f"|format(last_close.reported_cash) }}</p>
+            {% if last_close.difference|round(2) == 0 %}
+                <p class="ok">Diferencia: $0.00 (cuadró perfecto)</p>
+            {% elif last_close.difference > 0 %}
+                <p class="bad">Diferencia (sobró): ${{ "%.2f"|format(last_close.difference) }}</p>
+            {% else %}
+                <p class="bad">Diferencia (faltó): ${{ "%.2f"|format(last_close.difference|abs) }}</p>
+            {% endif %}
+        {% else %}
+            <p>Todavía no hay cierres registrados.</p>
+        {% endif %}
+    </div>
+</div>
+</body>
+</html>
+"""
+
+
+def render_template_string(template_str: str, **context):
+    return HTMLResponse(content=Template(template_str).render(**context))
+
+
+# ----------------- LOGIN / MENÚ -----------------
+
+
+@app.get("/", response_class=HTMLResponse)
+def root(request: Request, db: Session = Depends(get_session)):
+    user = get_current_user(request, db)
+    if user:
+        return RedirectResponse(url="/menu", status_code=302)
+    return render_template_string(LOGIN_HTML, error=None)
+
+
+@app.get("/logout")
+def logout():
+    response = RedirectResponse(url="/", status_code=302)
+    response.delete_cookie("session_id")
+    return response
+
+
+@app.post("/login", response_class=HTMLResponse)
+def login(
+    request: Request,
+    username: str = Form(...),
+    password: str = Form(...),
+    db: Session = Depends(get_session),
+):
+    user = db.exec(select(User).where(User.username == username)).first()
+    if not user or user.hashed_password != password:
+        return render_template_string(LOGIN_HTML, error="Usuario o contraseña incorrectos")
+    token = str(uuid.uuid4())
+    sessions[token] = user.id
+    response = RedirectResponse(url="/menu", status_code=302)
+    response.set_cookie("session_id", token, httponly=True)
+    return response
+
+
+@app.get("/menu", response_class=HTMLResponse)
+def menu(
+    request: Request,
+    db: Session = Depends(get_session),
+):
+    user = get_current_user(request, db)
+    if not user:
+        return RedirectResponse(url="/", status_code=302)
+    return render_template_string(DASHBOARD_HTML, user=user)
+
+
+# ----------------- POS / PEDIDOS -----------------
+
+
+@app.get("/pos", response_class=HTMLResponse)
+def pos(
+    request: Request,
+    db: Session = Depends(get_session),
+):
+    user = get_current_user(request, db)
+    if not user:
+        return RedirectResponse(url="/", status_code=302)
+
+    categories = db.exec(select(Category).order_by(Category.name)).all()
+    for c in categories:
+        c.products
+
+    low_inventory = db.exec(
+        select(IngredientInventory).where(IngredientInventory.stock <= IngredientInventory.min_stock)
+    ).all()
+
+    return render_template_string(
+        POS_HTML,
+        user=user,
+        categories=categories,
+        last_order=None,
+        last_total=0.0,
+        ticket=None,
+        kitchen=None,
+        low_inventory=low_inventory,
+        alert_message=None,
+    )
+
+
+def build_ticket(order: Order, items: List[OrderItem], total: float, item_options: Dict[int, str]) -> str:
+    lines = []
+    lines.append("------ SUSHI POS ------")
+    lines.append(f"Pedido #{order.id}")
+    lines.append(f"Tipo: {order.order_type}")
+    if order.order_type == "COMEDOR":
+        lines.append(f"Mesa: {order.table_number}")
+    else:
+        if order.customer_name:
+            lines.append(f"Cliente: {order.customer_name}")
+    if order.delivery_platform:
+        lines.append(f"Plataforma: {order.delivery_platform}")
+    lines.append("-----------------------")
+    for it in items:
+        lines.append(f"{it.quantity} x {it.product.name}  ${it.unit_price:.2f}")
+        extra = item_options.get(it.product_id)
+        if extra:
+            lines.append(f"   -> {extra}")
+    lines.append("-----------------------")
+    lines.append(f"TOTAL: ${total:.2f}")
+    lines.append("Gracias por su compra")
+    return "\n".join(lines)
+
+
+def build_kitchen_ticket(order: Order, items: List[OrderItem], item_options: Dict[int, str]) -> str:
+    lines = []
+    lines.append("**** COMANDA COCINA ****")
+    lines.append(f"Pedido #{order.id} - {order.order_type}")
+    if order.order_type == "COMEDOR":
+        lines.append(f"Mesa: {order.table_number}")
+    else:
+        if order.customer_name:
+            lines.append(f"Cliente: {order.customer_name}")
+    if order.delivery_platform:
+        lines.append(f"Plataforma: {order.delivery_platform}")
+    lines.append("------------------------")
+    for it in items:
+        lines.append(f"{it.quantity} x {it.product.name}")
+        extra = item_options.get(it.product_id)
+        if extra:
+            lines.append(f"   -> {extra}")
+    lines.append("------------------------")
+    lines.append("FIN COMANDA")
+    return "\n".join(lines)
+
+
+def write_ticket_files(order: Order, ticket: str, kitchen: str):
+    os.makedirs("tickets_cliente", exist_ok=True)
+    os.makedirs("comandas_cocina", exist_ok=True)
+    with open(f"tickets_cliente/ticket_{order.id}.txt", "w", encoding="utf-8") as f:
+        f.write(ticket)
+    with open(f"comandas_cocina/comanda_{order.id}.txt", "w", encoding="utf-8") as f:
+        f.write(kitchen)
+
+
+@app.post("/orders/create", response_class=HTMLResponse)
+async def create_order(
+    request: Request,
+    order_type: str = Form(...),
+    reference: str = Form(""),
+    delivery_platform: str = Form(""),
+    db: Session = Depends(get_session),
+):
+    user = get_current_user(request, db)
+    if not user:
+        return RedirectResponse(url="/", status_code=302)
+
+    form = await request.form()
+
+    # 1) Leer lo que el usuario pidió (pero SIN guardar todavía en la BD)
+    requested = []  # lista de dicts: {product, qty, options_text, skip_alga, skip_pepino}
+    alert_message = None
+
+    for key, value in form.items():
+        if not key.startswith("qty_"):
+            continue
+        try:
+            qty = int(value)
+        except (ValueError, TypeError):
+            continue
+        if qty <= 0:
+            continue
+
+        product_id = int(key.split("_")[1])
+        product = db.get(Product, product_id)
+        if not product:
+            continue
+
+        # Opciones (alga, empanizado, notas)
+        alga_opt = form.get(f"alga_{product_id}", "").strip()
+        emp_opt = form.get(f"emp_{product_id}", "").strip()
+        nota_opt_raw = form.get(f"nota_{product_id}", "").strip()
+        nota_opt_lower = nota_opt_raw.lower()
+
+        parts = []
+        if alga_opt:
+            parts.append(alga_opt)
+        if emp_opt:
+            parts.append(emp_opt)
+        if nota_opt_raw:
+            parts.append(nota_opt_raw)
+        options_text = " / ".join(parts) if parts else ""
+
+        # Flags para receta
+        skip_alga = (alga_opt == "Sin alga")
+        # si en las notas escribes "sin pepino" (con mayús/minus indistinto)
+        skip_pepino = ("sin pepino" in nota_opt_lower)
+
+        requested.append(
+            {
+                "product": product,
+                "qty": qty,
+                "options_text": options_text,
+                "skip_alga": skip_alga,
+                "skip_pepino": skip_pepino,
+            }
+        )
+
+    # Preparar datos para recargar pantalla si algo falla
+    categories = db.exec(select(Category).order_by(Category.name)).all()
+    for c in categories:
+        c.products
+    low_inventory = db.exec(
+        select(IngredientInventory).where(IngredientInventory.stock <= IngredientInventory.min_stock)
+    ).all()
+
+    if not requested:
+        return render_template_string(
+            POS_HTML,
+            user=user,
+            categories=categories,
+            last_order=None,
+            last_total=0.0,
+            ticket=None,
+            kitchen=None,
+            low_inventory=low_inventory,
+            alert_message="No agregaste ningún producto al pedido.",
+        )
+
+    # 2) Verificar si hay suficientes ingredientes para TODO lo que se pidió
+    #    tomando en cuenta "Sin alga" y "sin pepino".
+    shortages: Dict[str, bool] = {}  # nombre_ingrediente -> True (falta)
+
+    for req in requested:
+        prod = req["product"]
+        qty = req["qty"]
+        skip_alga = req["skip_alga"]
+        skip_pepino = req["skip_pepino"]
+
+        receta = db.exec(
+            select(RecipeItem).where(RecipeItem.product_id == prod.id)
+        ).all()
+
+                for r in receta:
+            ing = db.get(Ingredient, r.ingredient_id)
+            if not ing:
+                continue
+
+            # reglas para omitir ingredientes según las opciones del cliente
+            if skip_alga and "alga" in ing.name.lower():
+                continue
+            if skip_pepino and "pepino" in ing.name.lower():
+                continue
+
+            consumo = qty * r.quantity_per_unit
+            inv = db.exec(
+                select(IngredientInventory).where(
+                    IngredientInventory.ingredient_id == ing.id
+                )
+            ).first()
+            available = inv.stock if inv else 0
+            if consumo > available:
+                shortages[ing.name] = True
+
+    if shortages:
+        # Si falta al menos un ingrediente, NO creamos el pedido ni descontamos nada
+        if len(shortages) == 1:
+            nombre = list(shortages.keys())[0]
+            alert_message = f"⚠ Cuidado: ya no tenemos suficiente {nombre} para este pedido."
+        else:
+            nombres = ", ".join(shortages.keys())
+            alert_message = f"⚠ Cuidado: faltan ingredientes para este pedido: {nombres}."
+
+        return render_template_string(
+            POS_HTML,
+            user=user,
+            categories=categories,
+            last_order=None,
+            last_total=0.0,
+            ticket=None,
+            kitchen=None,
+            low_inventory=low_inventory,
+            alert_message=alert_message,
+        )
+
+    # 3) Si sí alcanza todo, ahora sí creamos la Orden y los OrderItem, y descontamos inventario
+    order = Order(
+        order_type=order_type,
+        table_number=reference if order_type == "COMEDOR" else None,
+        customer_name=reference if order_type != "COMEDOR" else None,
+        delivery_platform=delivery_platform or None,
+    )
+    db.add(order)
+    db.commit()
+    db.refresh(order)
+
+    items: List[OrderItem] = []
+    total = 0.0
+    item_options: Dict[int, str] = {}
+
+    for req in requested:
+        prod = req["product"]
+        qty = req["qty"]
+        options_text = req["options_text"]
+        skip_alga = req["skip_alga"]
+        skip_pepino = req["skip_pepino"]
+
+        if options_text:
+            item_options[prod.id] = options_text
+
+        it = OrderItem(
+            order_id=order.id,
+            product_id=prod.id,
+            quantity=qty,
+            unit_price=prod.price,
+        )
+        db.add(it)
+        items.append(it)
+        total += qty * prod.price
+
+        # Descontar ingredientes tomando en cuenta las opciones
+        receta = db.exec(
+            select(RecipeItem).where(RecipeItem.product_id == prod.id)
+        ).all()
+        for r in receta:
+            ing = db.get(Ingredient, r.ingredient_id)
+            if not ing:
+                continue
+
+            if skip_alga and "alga" in ing.name.lower():
+                continue
+            if skip_pepino and "pepino" in ing.name.lower():
+                continue
+
+            consumo = qty * r.quantity_per_unit
+            inv = db.exec(
+                select(IngredientInventory).where(
+                    IngredientInventory.ingredient_id == ing.id
+                )
+            ).first()
+            if inv:
+                inv.stock = max(inv.stock - consumo, 0)
+
+
+    db.commit()
+    for it in items:
+        db.refresh(it)
+        db.refresh(it.product)
+
+    ticket = build_ticket(order, items, total, item_options)
+    kitchen = build_kitchen_ticket(order, items, item_options)
+    write_ticket_files(order, ticket, kitchen)
+
+    low_inventory = db.exec(
+        select(IngredientInventory).where(IngredientInventory.stock <= IngredientInventory.min_stock)
+    ).all()
+
+    return render_template_string(
+        POS_HTML,
+        user=user,
+        categories=categories,
+        last_order=order,
+        last_total=total,
+        ticket=ticket,
+        kitchen=kitchen,
+        low_inventory=low_inventory,
+        alert_message=None,
+    )
+
+
+# ----------------- PEDIDOS RECIENTES -----------------
+
+
+@app.get("/orders/list", response_class=HTMLResponse)
+def list_orders(
+    request: Request,
+    db: Session = Depends(get_session),
+):
+    user = get_current_user(request, db)
+    if not user:
+        return RedirectResponse(url="/", status_code=302)
+
+    orders = db.exec(select(Order).order_by(Order.id.desc()).limit(30)).all()
+
+    html = "<h2>Últimos pedidos</h2>"
+    html += '<a href="/menu">⬅ Volver al menú</a><br><br>'
+    html += "<table border='1' cellpadding='4' cellspacing='0'>"
+    html += "<tr><th>ID</th><th>Tipo</th><th>Referencia</th><th>Plataforma</th></tr>"
+    for o in orders:
+        ref = o.table_number or o.customer_name or ""
+        html += f"<tr><td>{o.id}</td><td>{o.order_type}</td><td>{ref}</td><td>{o.delivery_platform or ''}</td></tr>"
+    html += "</table>"
+    return HTMLResponse(html)
+
+
+# ----------------- INVENTARIO (INGREDIENTES) -----------------
+
+
+@app.get("/inventario", response_class=HTMLResponse)
+def inventario(
+    request: Request,
+    db: Session = Depends(get_session),
+):
+    user = get_current_user(request, db)
+    if not user:
+        return RedirectResponse(url="/", status_code=302)
+
+    items = db.exec(select(IngredientInventory).order_by(IngredientInventory.id)).all()
+
+    html = "<h2>Inventario de ingredientes</h2>"
+    html += '<a href="/menu">⬅ Volver al menú</a><br><br>'
+    html += "<table border='1' cellpadding='4' cellspacing='0'>"
+    html += "<tr><th>Ingrediente</th><th>Stock</th><th>Mínimo</th><th>Unidad</th><th>Estado</th></tr>"
+    for i in items:
+        estado = "OK"
+        color = "green"
+        if i.stock <= i.min_stock:
+            estado = "BAJO"
+            color = "red"
+        html += (
+            f"<tr>"
+            f"<td>{i.ingredient.name}</td>"
+            f"<td>{i.stock}</td>"
+            f"<td>{i.min_stock}</td>"
+            f"<td>{i.ingredient.unit}</td>"
+            f"<td style='color:{color};'>{estado}</td>"
+            f"</tr>"
+        )
+    html += "</table>"
+    return HTMLResponse(html)
+
+
+# ----------------- BOT / AUTOMATIZACIÓN -----------------
+
+
+@app.get("/bot/panel", response_class=HTMLResponse)
+def bot_panel(
+    request: Request,
+    db: Session = Depends(get_session),
+):
+    user = get_current_user(request, db)
+    if not user:
+        return RedirectResponse(url="/", status_code=302)
+
+    low_inventory = db.exec(
+        select(IngredientInventory).where(IngredientInventory.stock <= IngredientInventory.min_stock)
+    ).all()
+
+    text_lines = []
+    if not low_inventory:
+        text_lines.append("Todo en orden, no hay ingredientes por debajo del mínimo.")
+    else:
+        text_lines.append("⚠ FALTANTES / INGREDIENTES BAJOS:")
+        for item in low_inventory:
+            text_lines.append(
+                f"- {item.ingredient.name}: {item.stock} {item.ingredient.unit} (mínimo {item.min_stock})"
+            )
+
+    text_for_whatsapp = "\n".join(text_lines)
+
+    html = "<h2>Bot & Automatización</h2>"
+    html += '<a href="/menu">⬅ Volver al menú</a><br><br>'
+    html += "<p>Este texto lo puedes copiar y pegar en WhatsApp por ahora. Más adelante se conectará a la API.</p>"
+    html += "<textarea style='width:100%;height:200px;'>" + text_for_whatsapp + "</textarea>"
+    html += "<p>También está disponible como endpoint para un bot en: <code>/bot/low_stock_text</code></p>"
+    return HTMLResponse(html)
+
+
+@app.get("/bot/low_stock_text", response_class=PlainTextResponse)
+def bot_low_stock_text(db: Session = Depends(get_session)):
+    low_inventory = db.exec(
+        select(IngredientInventory).where(IngredientInventory.stock <= IngredientInventory.min_stock)
+    ).all()
+    if not low_inventory:
+        return "Todo en orden, no hay ingredientes por debajo del mínimo."
+    lines = ["FALTANTES / INGREDIENTES BAJOS:"]
+    for item in low_inventory:
+        lines.append(
+            f"- {item.ingredient.name}: {item.stock} {item.ingredient.unit} (mínimo {item.min_stock})"
+        )
+    return "\n".join(lines)
+
+
+# ----------------- UTILIDAD: TOTAL VENTAS -----------------
+
+
+def calcular_total_ventas(db: Session) -> float:
+    orders = db.exec(select(Order)).all()
+    total = 0.0
+    for o in orders:
+        items = db.exec(select(OrderItem).where(OrderItem.order_id == o.id)).all()
+        for it in items:
+            total += it.quantity * it.unit_price
+    return total
+
+
+# ----------------- REPORTES SIMPLES -----------------
+
+
+@app.get("/reportes", response_class=HTMLResponse)
+def reportes(
+    request: Request,
+    db: Session = Depends(get_session),
+):
+    user = get_current_user(request, db)
+    if not user:
+        return RedirectResponse(url="/", status_code=302)
+
+    total_ventas = calcular_total_ventas(db)
+
+    html = "<h2>Reportes (demo)</h2>"
+    html += '<a href="/menu">⬅ Volver al menú</a><br><br>'
+    html += f"<p>Total de ventas acumuladas (muy simple): <strong>${total_ventas:.2f}</strong></p>"
+    html += "<p>Más adelante se puede hacer por día, por mes, por producto, etc.</p>"
+    return HTMLResponse(html)
+
+
+# ----------------- CIERRE DE CAJA -----------------
+
+
+@app.get("/caja/cierre", response_class=HTMLResponse)
+def caja_cierre(
+    request: Request,
+    db: Session = Depends(get_session),
+):
+    user = get_current_user(request, db)
+    if not user:
+        return RedirectResponse(url="/", status_code=302)
+
+    total_ventas = calcular_total_ventas(db)
+    last_close = db.exec(select(CashClose).order_by(CashClose.id.desc())).first()
+
+    return render_template_string(
+        CIERRE_CAJA_HTML,
+        user=user,
+        total_ventas=total_ventas,
+        last_close=last_close,
+        closed=False,
+        difference=0.0,
+    )
+
+
+@app.post("/caja/cierre", response_class=HTMLResponse)
+def caja_cierre_post(
+    request: Request,
+    reported_cash: float = Form(...),
+    db: Session = Depends(get_session),
+):
+    user = get_current_user(request, db)
+    if not user:
+        return RedirectResponse(url="/", status_code=302)
+
+    total_ventas = calcular_total_ventas(db)
+    difference = reported_cash - total_ventas
+
+    close = CashClose(
+        user_id=user.id,
+        total_sales=total_ventas,
+        reported_cash=reported_cash,
+        difference=difference,
+    )
+    db.add(close)
+    db.commit()
+    db.refresh(close)
+
+    return render_template_string(
+        CIERRE_CAJA_HTML,
+        user=user,
+        total_ventas=total_ventas,
+        last_close=close,
+        closed=True,
+        difference=difference,
+    )

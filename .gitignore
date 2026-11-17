@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+build/
+dist/
+*.spec
+installer/
+*.pyc
+*.pyo
+
+# Entorno virtual
+venv/
+
+# Base de datos local
+*.db
+
+# Archivos generados por el POS
+tickets_cliente/
+comandas_cocina/
+
+# Temporales
+test.txt
+*.log

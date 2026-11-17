@@ -1,0 +1,278 @@
+from fastapi import FastAPI, Request, Form
+from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.templating import Jinja2Templates
+from sqlmodel import SQLModel, Field, create_engine, Session, select
+
+
+# -------------------------------------------------
+#  CONFIGURACIÓN BÁSICA DE LA APP
+# -------------------------------------------------
+app = FastAPI()
+
+# Carpeta donde estarán los .html
+templates = Jinja2Templates(directory="templates")
+
+# Base de datos SQLite
+engine = create_engine("sqlite:///sushi_pos.db")
+
+
+# -------------------------------------------------
+#  MODELOS DE BASE DE DATOS
+# -------------------------------------------------
+class User(SQLModel, table=True):
+    id: int | None = Field(default=None, primary_key=True)
+    username: str
+    full_name: str
+    # Por ahora usaremos la contraseña en TEXTO PLANO en este campo
+    hashed_password: str
+    is_admin: bool = False
+
+
+class Ingredient(SQLModel, table=True):
+    id: int | None = Field(default=None, primary_key=True)
+    name: str
+    stock: float
+    unidad: str
+
+
+class Ticket(SQLModel, table=True):
+    id: int | None = Field(default=None, primary_key=True)
+    contenido: str
+    total: float
+
+
+def create_db() -> None:
+    """Crea las tablas si no existen."""
+    SQLModel.metadata.create_all(engine)
+
+
+create_db()
+
+
+# ============================================================
+#                    FUNCIONES AUXILIARES
+# ============================================================
+def check_ingredientes(receta: list[dict]) -> tuple[bool, str]:
+    """
+    Revisa si hay suficientes ingredientes basado en la receta.
+    Cada item de la receta es un dict:
+        {"nombre": "pepino", "cantidad": 0.10}
+    """
+    with Session(engine) as session:
+        for r in receta:
+            ing = session.exec(
+                select(Ingredient).where(Ingredient.name == r["nombre"])
+            ).first()
+
+            if not ing:
+                return False, f"Ingrediente NO encontrado en inventario: {r['nombre']}"
+
+            if ing.stock < r["cantidad"]:
+                return False, f"NO hay suficiente {r['nombre']}"
+
+    return True, ""
+
+
+def descontar_ingredientes(receta: list[dict]) -> None:
+    """
+    Descuenta ingredientes después de validar la orden.
+    """
+    with Session(engine) as session:
+        for r in receta:
+            ing = session.exec(
+                select(Ingredient).where(Ingredient.name == r["nombre"])
+            ).first()
+            if not ing:
+                # En teoría no debería pasar porque ya validamos
+                continue
+            ing.stock -= r["cantidad"]
+            session.add(ing)
+
+        session.commit()
+
+
+# ============================================================
+#                    RUTAS PRINCIPALES (WEB)
+# ============================================================
+
+# -------- PANTALLA DE LOGIN (GET) --------
+# Usa la MISMA función para "/" y "/login"
+@app.get("/", response_class=HTMLResponse)
+@app.get("/login", response_class=HTMLResponse)
+def login_page(request: Request):
+    """
+    Muestra el formulario de login.
+    """
+    return templates.TemplateResponse("login.html", {"request": request})
+
+
+# -------- PROCESAR LOGIN (POST) --------
+@app.post("/login", response_class=HTMLResponse)
+def login(
+    request: Request,
+    username: str = Form(...),
+    password: str = Form(...),
+):
+    """
+    Valida usuario/contraseña en texto plano.
+    """
+    with Session(engine) as session:
+        user = session.exec(
+            select(User).where(User.username == username)
+        ).first()
+
+        # Comparación directa, SIN hash (por ahora)
+        if not user or user.hashed_password != password:
+            return templates.TemplateResponse(
+                "login.html",
+                {"request": request, "error": "Usuario o contraseña incorrectos"},
+                status_code=400,
+            )
+
+        # Guardamos solo el id en una cookie sencilla
+        response = RedirectResponse("/menu", status_code=302)
+        response.set_cookie("user_id", str(user.id))
+        return response
+
+
+# -------- MENÚ PRINCIPAL --------
+@app.get("/menu", response_class=HTMLResponse)
+def menu(request: Request):
+    """
+    Muestra el menú principal del POS.
+    """
+    return templates.TemplateResponse("menu.html", {"request": request})
+
+
+# ============================================================
+#      AGREGAR PRODUCTOS A COMANDA (CON / SIN ALGA)
+# ============================================================
+@app.post("/agregar_producto", response_class=HTMLResponse)
+def agregar_producto(
+    request: Request,
+    producto: str = Form(...),
+    con_alga: str = Form(...),   # "si" o "no"
+    notas: str = Form(""),
+):
+    """
+    Agrega un producto (ej. California) a la comanda,
+    valida inventario por ingredientes y descuenta.
+    """
+    receta: list[dict] = []
+
+    # ----------------- EJEMPLO DE RECETA -----------------
+    if producto == "California":
+        receta = [
+            {"nombre": "arroz", "cantidad": 0.20},
+            {"nombre": "pepino", "cantidad": 0.10},
+            {"nombre": "aguacate", "cantidad": 0.10},
+        ]
+
+        # Solo descuenta alga si el cliente dijo que sí
+        if con_alga == "si":
+            receta.append({"nombre": "alga", "cantidad": 1})
+
+    # Aquí podrías agregar más productos:
+    # elif producto == "Philadelphia":
+    #     receta = [...]
+    #     if con_alga == "si":
+    #         receta.append(...)
+
+    # ------- Validación de inventario -------
+    ok, mensaje = check_ingredientes(receta)
+    if not ok:
+        return templates.TemplateResponse(
+            "error.html", {"request": request, "mensaje": mensaje}
+        )
+
+    # ------- Descontar ingredientes -------
+    descontar_ingredientes(receta)
+
+    # Render de confirmación
+    return templates.TemplateResponse(
+        "ok.html",
+        {
+            "request": request,
+            "producto": producto,
+            "notas": notas,
+            "con_alga": con_alga,
+        },
+    )
+
+
+# ============================================================
+#                  INVENTARIO – VER / AGREGAR
+# ============================================================
+@app.get("/inventario", response_class=HTMLResponse)
+def ver_inventario(request: Request):
+    """
+    Muestra todos los ingredientes del inventario.
+    """
+    with Session(engine) as session:
+        ingredientes = session.exec(select(Ingredient)).all()
+
+    return templates.TemplateResponse(
+        "inventario.html",
+        {"request": request, "ingredientes": ingredientes},
+    )
+
+
+@app.post("/inventario/agregar", response_class=HTMLResponse)
+def inventario_agregar(
+    request: Request,
+    nombre: str = Form(...),
+    stock: float = Form(...),
+    unidad: str = Form("kg"),
+):
+    """
+    Agrega un ingrediente nuevo al inventario.
+    """
+    with Session(engine) as session:
+        ing = Ingredient(name=nombre, stock=stock, unidad=unidad)
+        session.add(ing)
+        session.commit()
+
+    return RedirectResponse("/inventario", status_code=302)
+
+
+# ============================================================
+#                        CIERRE DE CAJA
+# ============================================================
+@app.get("/cierre_caja", response_class=HTMLResponse)
+def cierre_caja(request: Request):
+    """
+    Muestra todos los tickets y el total del día.
+    """
+    with Session(engine) as session:
+        tickets = session.exec(select(Ticket)).all()
+
+    total = sum(t.total for t in tickets)
+
+    return templates.TemplateResponse(
+        "cierre_caja.html",
+        {"request": request, "tickets": tickets, "total": total},
+    )
+
+
+# ============================================================
+#                       GENERAR TICKET
+# ============================================================
+@app.post("/ticket", response_class=HTMLResponse)
+def generar_ticket(
+    request: Request,
+    contenido: str = Form(...),
+    total: float = Form(...),
+):
+    """
+    Guarda un ticket en la base de datos y muestra
+    una pantalla con el detalle.
+    """
+    with Session(engine) as session:
+        t = Ticket(contenido=contenido, total=total)
+        session.add(t)
+        session.commit()
+
+    return templates.TemplateResponse(
+        "ticket_generado.html",
+        {"request": request, "contenido": contenido, "total": total},
+    )
